@@ -32,7 +32,10 @@ func main() {
 	event2 := zlogs.Info().WithFields(data)
 	event.Msgf("hello world %s", "jay")
 	event2.Msgf("hello world %s", "jay2")
-
+	zlogs.Info().
+		WithField("fig2", map[string]string{
+			"password": "2111",
+		}).Msg("hello world")
 	zlogs.NewGORMLogger(&zlogs.Config{
 		Level: "debug",
 		Masking: zlogs.ConfigMasking{

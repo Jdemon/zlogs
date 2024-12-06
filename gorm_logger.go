@@ -15,8 +15,8 @@ type GORMLogger struct {
 
 func NewGORMLogger(config *Config) *GORMLogger {
 	loggerGORM := zerolog.New(os.Stdout).Hook(&InitHook{
-		appName:       config.AppName,
-		disableCaller: true,
+		AppName:       config.AppName,
+		DisableCaller: true,
 	}).With().Timestamp().Logger()
 
 	if lvl, err := zerolog.ParseLevel(config.Level); err != nil {

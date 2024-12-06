@@ -3,89 +3,91 @@ package zlogs
 import (
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
-	"sync"
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 )
 
+// redactedValue is the constant used to replace sensitive data fields with a masked value to prevent information leakage.
+const redactedValue = "***"
+
+// Logger wraps zerolog.Logger and includes ConfigMasking for masking purposes.
 type (
 	Logger struct {
 		*zerolog.Logger
-		Masking ConfigMasking
+		Masking MaskingConfig
 	}
 	Config struct {
 		AppName      string
-		Level        string        `mapstructure:"level"`
-		Masking      ConfigMasking `mapstructure:"masking"`
-		CallerEnable bool          `mapstructure:"callerEnable"`
+		Level        string
+		Masking      MaskingConfig
+		CallerEnable bool
 	}
-
-	ConfigMasking struct {
-		Enabled         bool     `mapstructure:"enabled"`
-		SensitiveFields []string `default:""`
+	MaskingConfig struct {
+		Enabled         bool
+		SensitiveFields []string
 	}
 	Event struct {
 		*zerolog.Event
 	}
 )
 
+// sensitiveFields contains a set of keys that are considered sensitive and need to be masked in logs or data processing.
 var (
 	sensitiveFields = map[string]struct{}{
 		"name": {}, "firstname": {}, "lastname": {}, "cardno": {}, "passport": {},
 		"passportid": {}, "passportno": {}, "nationalid": {}, "cid": {},
-		"citizen_id": {}, "cvv": {}, "password": {}, "x-api-key": {},
+		"citizen_id": {}, "cvc": {}, "password": {}, "x-api-key": {},
 		"authorization": {}, "x-authorization": {},
 	}
 	appNameKey = "appName"
-
-	loggerInstance *Logger
-	once           sync.Once
+	logger     *Logger
 )
 
+// newStandardLogger initializes a standard Logger instance with default configuration for level "debug" and masking disabled.
 func newStandardLogger() *Logger {
-	configDefault := &Config{
+	defaultConfig := &Config{
 		Level: "debug",
-		Masking: ConfigMasking{
+		Masking: MaskingConfig{
 			Enabled: false,
 		},
 	}
-	return newLogger(configDefault)
+	return newLogger(defaultConfig)
 }
 
+// newLogger initializes the global logger instance with the provided configuration.
 func newLogger(config *Config) *Logger {
-	once.Do(func() {
-		logger := zerolog.New(os.Stdout).Hook(&InitHook{
-			appName:       config.AppName,
-			disableCaller: config.CallerEnable,
-		}).With().Timestamp().Logger()
+	zlog.Logger = initZerologLogger(config)
+	logger = &Logger{
+		Logger:  &zlog.Logger,
+		Masking: config.Masking,
+	}
 
-		zerolog.TimeFieldFormat = "2006-01-02T15:04:05-0700"
-		zerolog.TimestampFieldName = "timestamp"
-		zerolog.LevelFieldName = "severity"
-		zerolog.MessageFieldName = "message"
-
-		if lvl, err := zerolog.ParseLevel(config.Level); err != nil {
-			zerolog.SetGlobalLevel(zerolog.DebugLevel)
-		} else {
-			zerolog.SetGlobalLevel(lvl)
-		}
-
-		for _, field := range config.Masking.SensitiveFields {
-			sensitiveFields[strings.ToLower(field)] = struct{}{}
-		}
-
-		zlog.Logger = logger
-		loggerInstance = &Logger{
-			Logger:  &logger,
-			Masking: config.Masking,
-		}
-	})
-
-	return loggerInstance
+	return logger
 }
 
+// initZerologLogger initializes and configures a zerolog.Logger instance based on the provided configuration.
+func initZerologLogger(config *Config) zerolog.Logger {
+	zerolog.TimestampFieldName = "timestamp"
+	zerolog.LevelFieldName = "severity"
+	zerolog.MessageFieldName = "message"
+	if level, err := zerolog.ParseLevel(config.Level); err != nil {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(level)
+	}
+	for _, field := range config.Masking.SensitiveFields {
+		sensitiveFields[strings.ToLower(field)] = struct{}{}
+	}
+	return zerolog.New(os.Stdout).Hook(&InitHook{
+		AppName:       config.AppName,
+		DisableCaller: config.CallerEnable,
+	}).With().Timestamp().Logger().Level(zerolog.GlobalLevel())
+}
+
+// maskFields processes a map to mask sensitive fields based on the Logger configuration.
 func (l *Logger) maskFields(value map[string]interface{}) map[string]interface{} {
 	newData := make(map[string]interface{}, len(value))
 	for key, fieldValue := range value {
@@ -94,55 +96,78 @@ func (l *Logger) maskFields(value map[string]interface{}) map[string]interface{}
 	return newData
 }
 
-func (l *Logger) valueMasking(newData map[string]interface{}, key string, fieldValue interface{}) map[string]interface{} {
-	// If the field is sensitive
-	if _, exists := sensitiveFields[strings.ToLower(key)]; exists {
-		newData[key] = "***"
-		return newData
+// valueMasking masks sensitive fields in a nested map or array structure, otherwise it retains the original field value.
+func (l *Logger) valueMasking(result map[string]interface{}, key string, value interface{}) map[string]interface{} {
+	if isSensitiveField(key) {
+		result[key] = redactedValue
+		return result
 	}
-	switch subFieldValue := fieldValue.(type) {
+	switch v := value.(type) {
 	case map[string]interface{}:
-		newData[key] = l.maskFields(subFieldValue)
+		result[key] = l.maskFields(v)
 	case []interface{}:
-		newData[key] = l.maskArrayFields(subFieldValue)
+		result[key] = l.maskArrayFields(v)
 	default:
-		newData[key] = subFieldValue
+		result[key] = v
 	}
-	return newData
+	return result
 }
 
-func (l *Logger) maskArrayFields(arrayFieldValue []interface{}) []interface{} {
-	for index, value := range arrayFieldValue {
+// isSensitiveField checks if a given field name is considered sensitive based on a predefined list of sensitive fields.
+func isSensitiveField(field string) bool {
+	_, exists := sensitiveFields[strings.ToLower(field)]
+	return exists
+}
+
+// maskArrayFields iterates over an array of interface values and applies field masking to any map elements.
+func (l *Logger) maskArrayFields(array []interface{}) []interface{} {
+	for i, value := range array {
 		if valueMap, ok := value.(map[string]interface{}); ok {
-			arrayFieldValue[index] = l.maskFields(valueMap)
+			array[i] = l.maskFields(valueMap)
 		}
 	}
-	return arrayFieldValue
+	return array
 }
 
+// WithField adds a key-value pair to the event, converting and masking the value if necessary, and returns the updated event.
 func (e *Event) WithField(key string, value interface{}) *Event {
-	fields := std.maskFields(map[string]interface{}{
-		key: convertStructToFields(value),
-	})
-	return e.WithFields(fields)
+	if !isPrimitiveType(value) {
+		value = logger.ConvertStructToFields(value)
+	}
+	return e.WithFields(logger.maskFields(map[string]interface{}{key: value}))
 }
 
+// isPrimitiveType determines if the given value is of a primitive Go type that does not require conversion.
+func isPrimitiveType(value interface{}) bool {
+	switch reflect.TypeOf(value).Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.String:
+		return true
+	default:
+		return false
+	}
+}
+
+// WithFields adds multiple fields to the event, masking sensitive data, and returns the updated event.
 func (e *Event) WithFields(fields map[string]interface{}) *Event {
-	fields = std.maskFields(fields)
+	fields = logger.maskFields(fields)
 	for key, fieldValue := range fields {
 		e.Event = e.Event.Interface(key, fieldValue)
 	}
 	return e
 }
 
+// WithError attaches an error to the Event and returns the modified Event.
 func (e *Event) WithError(err error) *Event {
 	e.Event = e.Err(err)
 	return e
 }
 
-func convertStructToFields(v any) map[string]interface{} {
-	marshal, _ := json.Marshal(v)
+// ConvertStructToFields converts a struct to a map of string keys and interface{} values using JSON marshaling.
+func (l *Logger) ConvertStructToFields(v any) map[string]interface{} {
+	data, _ := json.Marshal(v)
 	fields := make(map[string]interface{})
-	_ = json.Unmarshal(marshal, &fields)
+	_ = json.Unmarshal(data, &fields)
 	return fields
 }
